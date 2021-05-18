@@ -4,33 +4,41 @@ Scan directories to see if they have files modified in the last x days
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
-import subprocess
 
 
 def was_modified_after(path: Path, after: datetime):
     """
-    Return true if path or descendents were modified after given datetime
+    Return True, None if path or descendents were modified after given datetime
+
+    If they were *not*, return False, size_of_dir_in_bytes.
+
+    This somewhat ugly design lets us walk the file tree just once, and skip large
+    parts of it that are active. Since we only want to detect inactive directories
+    and report their size, this works ok.
     """
     after_ts = after.timestamp()
 
     stat = path.stat()
+    total_size = stat.st_size
 
     if stat.st_mtime >= after_ts:
-        return True
+        return True, None
 
     # Check files first before recursing into subdirectories
     # We only check files, symlinks with valid targets and directories
-    return any(c.stat().st_mtime >= after_ts for c in path.iterdir() if (c.is_file() or (c.is_symlink() and c.exists()))) or \
-        any(was_modified_after(c, after) for c in path.iterdir() if c.is_dir())
+    for c in path.iterdir():
+        if c.is_file() or (c.is_symlink() and c.exists()):
+            cstat = c.stat()
+            if cstat.st_mtime >= after_ts:
+                return True, None
+            total_size += cstat.st_size
+        elif c.is_dir():
+            was_modified, size = was_modified_after(c, after)
+            if was_modified:
+                return True, None
+            total_size += size
+    return False, total_size
 
-def get_dir_size(path: Path):
-    """
-    Use `du` to get size of directory
-
-    Faster than us walking through every file in python
-    """
-    output = subprocess.check_output(['du', '--bytes', '--max-depth=0', str(path)]).decode()
-    return int(output.split()[0])
 
 def main():
     argparser = argparse.ArgumentParser()
@@ -55,14 +63,14 @@ def main():
 
     for p in root_dir.iterdir():
         if p.is_dir():
-            if was_modified_after(p, cutoff_date):
+            is_active, dirsize = was_modified_after(p, cutoff_date)
+            if is_active:
                 print(f'Active -> {p.name}')
                 active_count += 1
             else:
-                size = get_dir_size(p)
-                print(f'Inactive -> {p.name:16} -> {(size / 1024 / 1024):.2f}mb')
-                inactive_count +=1
-                inactive_space += size
+                print(f'Inactive -> {p.name:16} -> {(dirsize / 1024 / 1024):.2f}mb')
+                inactive_count += 1
+                inactive_space += dirsize
     print(f'Active: {active_count}, Inactive: {inactive_count}, Inactive Size: {(inactive_space / 1024 / 1024 / 1024):.2f}')
 
 
