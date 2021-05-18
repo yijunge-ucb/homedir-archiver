@@ -3,27 +3,34 @@ Scan directories to see if they have files modified in the last x days
 """
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+import subprocess
 
 
-def walk(path: Path):
+def was_modified_after(path: Path, after: datetime):
+    """
+    Return true if path or descendents were modified after given datetime
+    """
+    after_ts = after.timestamp()
+
     stat = path.stat()
-    total_size = stat.st_size
-    newest_modified = stat.st_mtime
 
-    for c in path.iterdir():
-        # Only operate on files, non-broken symlinks and directories
-        if c.is_file() or (c.is_symlink() and c.exists()):
-            fstat = c.stat()
-            total_size += fstat.st_size
-            if fstat.st_mtime > newest_modified:
-                newest_modified = fstat.st_mtime
-        elif c.is_dir():
-            size, modified = walk(c)
-            total_size += size
-            if modified > newest_modified:
-                newest_modified = modified
-    return total_size, newest_modified
+    if stat.st_mtime >= after_ts:
+        return True
+
+    # Check files first before recursing into subdirectories
+    # We only check files, symlinks with valid targets and directories
+    return any(c.stat().st_mtime >= after_ts for c in path.iterdir() if (c.is_file() or (c.is_symlink() and c.exists()))) or \
+        any(was_modified_after(c, after) for c in path.iterdir() if c.is_dir())
+
+def get_dir_size(path: Path):
+    """
+    Use `du` to get size of directory
+
+    Faster than us walking through every file in python
+    """
+    output = subprocess.check_output(['du', '--bytes', '--max-depth=0', str(path)]).decode()
+    return int(output.split()[0])
 
 def main():
     argparser = argparse.ArgumentParser()
@@ -31,35 +38,33 @@ def main():
         "root_dir", help="Root directory containing user home directories", type=Path
     )
     argparser.add_argument(
-        "days_since",
+        "days_ago",
         type=int,
-        help="Number of days a directory needs to be untouched to count as inactive",
+        help="If a user directory was last touched this many days ago, it is considered inactive",
     )
 
     args = argparser.parse_args()
 
     root_dir: Path = args.root_dir
 
-    init_date = datetime.now()
+    cutoff_date = datetime.now() - timedelta(days=args.days_ago)
 
-    total_size = 0
-    active_size = 0
-    inactive_size = 0
+    inactive_count = 0
+    active_count = 0
+    inactive_space = 0
+
     for p in root_dir.iterdir():
-        size, newest_ts = walk(p)
-        newest_mtime = datetime.fromtimestamp(newest_ts)
-        last_modified = init_date - newest_mtime
-        is_active = last_modified.days < args.days_since
-        total_size += size
-        if is_active:
-            active_size += size
-        else:
-            inactive_size += size
-        size_in_mb = size / 1024 / 1024
-        print(f'{p.name:24} -> {size_in_mb:>12.2f} -> {is_active} -> {last_modified.days}')
+        if p.is_dir():
+            if was_modified_after(p, cutoff_date):
+                print(f'Active -> {p.name}')
+                active_count += 1
+            else:
+                size = get_dir_size(p)
+                print(f'Inactive -> {p.name:16} -> {(size / 1024 / 1024):.2f}mb')
+                inactive_count +=1
+                inactive_space += size
+    print(f'Active: {active_count}, Inactive: {inactive_count}, Inactive Size: {(inactive_space / 1024 / 1024 / 1024):.2f}')
 
-    print(f"active: {(active_size / 1024 / 1024 / 1024):.2f}gb inactive: {(inactive_size / 1024 / 1024 / 1024):.2f}gb")
-    print(f"| {(total_size / 1024 / 1024 / 1024):.2f} | {(inactive_size / total_size * 100):.2f}% |")
 
 if __name__ == '__main__':
     main()
