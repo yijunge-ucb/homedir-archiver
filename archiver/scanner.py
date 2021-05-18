@@ -14,14 +14,12 @@ def walk(path: Path):
         total_size = stat.st_size
         newest_modified = stat.st_mtime
         for c in path.iterdir():
-            if c.is_symlink() and not c.exists():
-                # Ignore symlinks that point to nowhere
-                # FIXME: Maybe we should try find the mtime of the symlink itself?
-                continue
-            size, modified = walk(c)
-            total_size += size
-            if modified > newest_modified:
-                newest_modified = modified
+            # Only accept files, directories and symlinks that point to a valid target
+            if c.is_file() or c.is_dir() or (c.is_symlink() and c.exists()):
+                size, modified = walk(c)
+                total_size += size
+                if modified > newest_modified:
+                    newest_modified = modified
         return total_size, newest_modified
 
 
