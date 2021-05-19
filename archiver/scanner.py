@@ -3,7 +3,10 @@ Scan directories to see if they have files modified in the last x days
 """
 import argparse
 from pathlib import Path
+import subprocess
 from datetime import datetime, timedelta
+import tempfile
+import hashlib
 
 
 def was_modified_after(path: Path, after: datetime):
@@ -40,6 +43,37 @@ def was_modified_after(path: Path, after: datetime):
     return False, total_size
 
 
+def md5sum(filename: Path):
+    """
+    Return md5 of given file.
+
+    Google Cloud Storage supports md5 to validate integrity of upload, so
+    we use it https://cloud.google.com/storage/docs/hashes-etags
+    """
+    return subprocess.check_output(["md5sum", str(filename)]).decode().split()[0]
+
+def archive_dir(dir_path: Path, out_path: Path):
+    """
+    Archive given directory reproducibly to out_path
+    """
+    cmd = [
+        "tar",
+        "--sort=name",
+        "--numeric-owner",
+        "--create", "--xz",
+        f"--file={out_path}",
+        dir_path,
+    ]
+    subprocess.check_call(cmd)
+
+
+def process_inactive_dir(dir_path: Path):
+    with tempfile.TemporaryDirectory() as d:
+        target_file = Path(d) / (dir_path.name + ".tar.gz")
+        archive_dir(dir_path, target_file)
+        return (target_file.stat().st_size, md5sum(target_file))
+
+
 def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument(
@@ -60,19 +94,24 @@ def main():
     inactive_count = 0
     active_count = 0
     inactive_space = 0
+    inactive_compressed_space = 0
 
     for p in root_dir.iterdir():
         if p.is_dir():
             is_active, dirsize = was_modified_after(p, cutoff_date)
             if is_active:
-                print(f'Active -> {p.name}')
+                print(f"Active -> {p.name}")
                 active_count += 1
             else:
-                print(f'Inactive -> {p.name:16} -> {(dirsize / 1024 / 1024):.2f}mb')
+                compressed_size, md5 = process_inactive_dir(p)
+                print(f"Inactive -> {p.name:16} -> {(dirsize / 1024 / 1024):.2f}mb -> compressed {(compressed_size / 1024 / 1024):.2f}mb")
                 inactive_count += 1
                 inactive_space += dirsize
-    print(f'Active: {active_count}, Inactive: {inactive_count}, Inactive Size: {(inactive_space / 1024 / 1024 / 1024):.2f}')
+                inactive_compressed_space += compressed_size
+    print(
+        f"Active: {active_count}, Inactive: {inactive_count}, Inactive Uncompressed Size: {(inactive_space / 1024 / 1024 / 1024):.2f}, Inactive Compressed Size: {(inactive_compressed_space / 1024 / 1024 / 1024):.2f}gb"
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
