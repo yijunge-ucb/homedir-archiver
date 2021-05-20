@@ -6,6 +6,9 @@ from pathlib import Path
 import subprocess
 from datetime import datetime, timedelta
 import tempfile
+import re
+from contextlib import contextmanager
+import sys
 
 
 def was_modified_after(path: Path, after: datetime):
@@ -42,54 +45,80 @@ def was_modified_after(path: Path, after: datetime):
     return False, total_size
 
 
-def md5sum(filename: Path):
+def md5sum_local(filename: Path):
     """
-    Return md5 of given file.
+    Return base64-encoded md5 of given file.
 
     Google Cloud Storage supports md5 to validate integrity of upload, so
-    we use it https://cloud.google.com/storage/docs/hashes-etags
+    we use it https://cloud.google.com/storage/docs/hashes-etags. GCS
+    prefers dealing with md5 in base64 format so we use that instead of the
+    more common hex format.
     """
-    return subprocess.check_output(["md5sum", str(filename)]).decode().split()[0]
+    output = subprocess.check_output([
+        'gsutil', '-q', 'hash', '-m',
+        str(filename)
+    ]).decode()
+    match = re.search(r'Hash \(md5\):\s*(.*)\n', output)
+    return match.group(1)
 
 
-def archive_dir(dir_path: Path, out_path: Path):
+def md5sum_gcs(object_path: str):
+    """
+    Return base64-encoded md5 of object_path on GCS
+    """
+    output = subprocess.check_output([
+        'gsutil', '-q', 'ls', '-L', object_path
+    ]).decode()
+    match = re.search(r'Hash \(md5\):\s*(.*)\n', output)
+    return match.group(1)
+
+
+@contextmanager
+def archive_dir(dir_path: Path):
     """
     Archive given directory reproducibly to out_path
     """
-    cmd = [
-        "tar",
-        "--sort=name",
-        "--numeric-owner",
-        "--create",
-        "--gzip",
-        f"--file={out_path}",
-        dir_path,
-    ]
-    subprocess.check_call(cmd)
+
+    with tempfile.TemporaryDirectory() as d:
+        target_file = Path(d) / (dir_path.name + ".tar.gz")
+        cmd = [
+            "tar",
+            "--sort=name",
+            "--numeric-owner",
+            "--create",
+            "--gzip",
+            f"--file={target_file}",
+            dir_path,
+        ]
+        try:
+            # Capture output and fail explicitly on non-0 error code
+            # Primarily to get rid of tar: Removing leading `/' from member names
+            subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            print(f"Executing {e.cmd} failed with code {e.returncode}", file=sys.stderr)
+            print(f"stdout: {e.stdout}", file=sys.stderr)
+            print(f"stderr: {e.stderr}", file=sys.stderr)
+            sys.exit(1)
+
+        yield target_file
 
 
-def upload_to_gcs(file_path: Path, object_prefix: str):
+def upload_to_gcs(file_path: Path, target_path: str):
     """
     Upload file_path to target_path on GCS
     """
-    md5 = md5sum(file_path)
-    target_path = f'{object_prefix}/{file_path.name}'
+    md5 = md5sum_local(file_path)
     subprocess.check_call(
         ["gsutil", "-q", "-h", f"Content-MD5={md5}", "cp", str(file_path), target_path]
     )
 
 
-def process_inactive_dir(dir_path: Path, target_object_path: str):
-    with tempfile.TemporaryDirectory() as d:
-        target_file = Path(d) / (dir_path.name + ".tar.gz")
-        archive_dir(dir_path, target_file)
-        size = target_file.stat().st_size
-        upload_to_gcs(target_file, target_object_path)
-        return size
-
-
 def main():
     argparser = argparse.ArgumentParser()
+    argparser.add_argument(
+        'action', choices=['validate', 'upload'],
+        help='Validate already uploaded files, or upload new files'
+    )
     argparser.add_argument(
         "root_dir", help="Root directory containing user home directories", type=Path
     )
@@ -117,18 +146,30 @@ def main():
 
     for p in root_dir.iterdir():
         if p.is_dir():
+            print(f'{p.name:32} -> ', end='')
             is_active, dirsize = was_modified_after(p, cutoff_date)
             if is_active:
-                print(f"Active -> {p.name}")
+                print(f'{"Active":17} -> Skipped')
                 active_count += 1
             else:
-                compressed_size = process_inactive_dir(p, object_prefix)
-                print(
-                    f"Inactive -> {p.name:16} -> {(dirsize / 1024 / 1024):.2f}mb -> compressed {(compressed_size / 1024 / 1024):.2f}mb"
-                )
-                inactive_count += 1
-                inactive_space += dirsize
-                inactive_compressed_space += compressed_size
+                with archive_dir(p) as target_file:
+                    size = target_file.stat().st_size
+                    inactive_count += 1
+                    inactive_compressed_space += size
+                    inactive_space += dirsize
+                    print(f'Archived {(size / 1024 / 1024):5.1f}mb -> ', end='')
+                    target_object_path = f'{object_prefix}/{target_file.name}'
+                    if args.action == 'upload':
+                        upload_to_gcs(target_file, target_object_path)
+                        print('Uploaded!')
+                    elif args.action == 'validate':
+                        local_md5 = md5sum_local(target_file)
+                        remote_md5 = md5sum_gcs(target_object_path)
+                        if local_md5 != remote_md5:
+                            print(f'Validation failed! local mdf: {local_md5}, remote md5: {remote_md5}')
+                            sys.exit(1)
+                        else:
+                            print('Validated!')
     print(
         f"Active: {active_count}, Inactive: {inactive_count}, Inactive Uncompressed Size: {(inactive_space / 1024 / 1024 / 1024):.2f}, Inactive Compressed Size: {(inactive_compressed_space / 1024 / 1024 / 1024):.2f}gb"
     )
