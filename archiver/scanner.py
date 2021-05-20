@@ -6,7 +6,6 @@ from pathlib import Path
 import subprocess
 from datetime import datetime, timedelta
 import tempfile
-import hashlib
 
 
 def was_modified_after(path: Path, after: datetime):
@@ -52,6 +51,7 @@ def md5sum(filename: Path):
     """
     return subprocess.check_output(["md5sum", str(filename)]).decode().split()[0]
 
+
 def archive_dir(dir_path: Path, out_path: Path):
     """
     Archive given directory reproducibly to out_path
@@ -60,18 +60,32 @@ def archive_dir(dir_path: Path, out_path: Path):
         "tar",
         "--sort=name",
         "--numeric-owner",
-        "--create", "--xz",
+        "--create",
+        "--gzip",
         f"--file={out_path}",
         dir_path,
     ]
     subprocess.check_call(cmd)
 
 
-def process_inactive_dir(dir_path: Path):
+def upload_to_gcs(file_path: Path, object_prefix: str):
+    """
+    Upload file_path to target_path on GCS
+    """
+    md5 = md5sum(file_path)
+    target_path = f'{object_prefix}/{file_path.name}'
+    subprocess.check_call(
+        ["gsutil", "-q", "-h", f"Content-MD5={md5}", "cp", str(file_path), target_path]
+    )
+
+
+def process_inactive_dir(dir_path: Path, target_object_path: str):
     with tempfile.TemporaryDirectory() as d:
         target_file = Path(d) / (dir_path.name + ".tar.gz")
         archive_dir(dir_path, target_file)
-        return (target_file.stat().st_size, md5sum(target_file))
+        size = target_file.stat().st_size
+        upload_to_gcs(target_file, target_object_path)
+        return size
 
 
 def main():
@@ -84,10 +98,15 @@ def main():
         type=int,
         help="If a user directory was last touched this many days ago, it is considered inactive",
     )
+    argparser.add_argument(
+        "object_prefix",
+        help="GCS Prefix (gs://<bucket-name>/prefix/) to upload archived user directories to",
+    )
 
     args = argparser.parse_args()
 
     root_dir: Path = args.root_dir
+    object_prefix: str = args.object_prefix.rstrip("/")
 
     cutoff_date = datetime.now() - timedelta(days=args.days_ago)
 
@@ -103,8 +122,10 @@ def main():
                 print(f"Active -> {p.name}")
                 active_count += 1
             else:
-                compressed_size, md5 = process_inactive_dir(p)
-                print(f"Inactive -> {p.name:16} -> {(dirsize / 1024 / 1024):.2f}mb -> compressed {(compressed_size / 1024 / 1024):.2f}mb")
+                compressed_size = process_inactive_dir(p, object_prefix)
+                print(
+                    f"Inactive -> {p.name:16} -> {(dirsize / 1024 / 1024):.2f}mb -> compressed {(compressed_size / 1024 / 1024):.2f}mb"
+                )
                 inactive_count += 1
                 inactive_space += dirsize
                 inactive_compressed_space += compressed_size
