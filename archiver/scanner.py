@@ -30,9 +30,11 @@ def was_modified_after(path: Path, after: datetime):
         return True, None
 
     # Check files first before recursing into subdirectories
-    # We only check files, symlinks with valid targets and directories
+    # Only files and directories are checked for freshness, symlinks
+    # and other kinds of special files are ignored. This only affects
+    # what is checked for freshness - `tar` copies everything anyway
     for c in path.iterdir():
-        if c.is_file() or (c.is_symlink() and c.exists()):
+        if c.is_file():
             cstat = c.stat()
             if cstat.st_mtime >= after_ts:
                 return True, None
