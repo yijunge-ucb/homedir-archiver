@@ -150,7 +150,7 @@ def main():
             print(f'{p.name:32} -> ', end='')
             is_active, dirsize = was_modified_after(p, cutoff_date)
             if is_active:
-                print(f'{"Active":17} -> Skipped')
+                print(f'{"Active":16} -> Skipped')
                 active_count += 1
             else:
                 with archive_dir(p) as target_file:
