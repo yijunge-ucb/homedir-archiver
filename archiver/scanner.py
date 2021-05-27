@@ -83,12 +83,13 @@ def archive_dir(dir_path: Path):
         target_file = Path(d) / (dir_path.name + ".tar.gz")
         cmd = [
             "tar",
+            f"--directory={dir_path}",
             "--sort=name",
             "--numeric-owner",
             "--create",
             "--gzip",
             f"--file={target_file}",
-            dir_path,
+            "."
         ]
         try:
             # Capture output and fail explicitly on non-0 error code
