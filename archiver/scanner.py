@@ -9,6 +9,7 @@ import tempfile
 import re
 from contextlib import contextmanager
 import sys
+import shutil
 
 
 def was_modified_after(path: Path, after: datetime):
@@ -134,6 +135,10 @@ def main():
         "object_prefix",
         help="GCS Prefix (gs://<bucket-name>/prefix/) to upload archived user directories to",
     )
+    argparser.add_argument(
+        "--delete",
+        help="Delete uploaded objects"
+    )
 
     args = argparser.parse_args()
 
@@ -164,7 +169,12 @@ def main():
                     target_object_path = f'{object_prefix}/{target_file.name}'
                     if args.action == 'upload':
                         upload_to_gcs(target_file, target_object_path)
-                        print('Uploaded!')
+                        print('Uploaded!', end='')
+                        if args.delete:
+                            # DELETE THE DIRECTORY
+                            shutil.rmtree(p)
+                            print('-> Deleted!', end='')
+                        print() # Print a newline
                     elif args.action == 'validate':
                         local_md5 = md5sum_local(target_file)
                         remote_md5 = md5sum_gcs(target_object_path)
