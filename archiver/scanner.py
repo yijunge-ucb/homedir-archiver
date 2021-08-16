@@ -7,41 +7,61 @@ import subprocess
 from datetime import datetime, timedelta
 import tempfile
 import re
+import os
 from contextlib import contextmanager
 import sys
 import shutil
 
 
-def was_modified_after(path: Path, after: datetime):
+NOTICE_CONTENT_TEMPLATE = """
+Your files have been archived due to inactivity.
+
+Send an email to ds-infrastructure@lists.berkeley.edu from your berkeley.edu
+email address to get a copy of your files. You must include the following
+text to help us retrieve your file:
+
+{object_id}
+"""
+
+
+def was_modified_after(path: Path, after: datetime, ignored_filenames: list):
     """
-    Return True, None if path or descendents were modified after given datetime
+    Return True, None if path or descendents have files modified after given datetime
 
     If they were *not*, return False, size_of_dir_in_bytes.
 
     This somewhat ugly design lets us walk the file tree just once, and skip large
     parts of it that are active. Since we only want to detect inactive directories
     and report their size, this works ok.
+
+    filenames in ignored_filenames will be ignored when testing the recentness
+    of a file.
+
+    Directory mtimes are ignored, primarily so that us putting in `notice` files about
+    where to find your archived directories does not mark a directory as 'active'. New
+    directory creations or file deletions in a directory will also no longer mark
+    a directory as active - a new file must be created or modified. This seems
+    acceptable.
     """
     after_ts = after.timestamp()
 
     stat = path.stat()
     total_size = stat.st_size
 
-    if stat.st_mtime >= after_ts:
-        return True, None
-
     # Check files first before recursing into subdirectories
-    # Only files and directories are checked for freshness, symlinks
+    # Only files are checked for freshness, symlinks
     # and other kinds of special files are ignored. This only affects
     # what is checked for freshness - `tar` copies everything anyway
     for c in path.iterdir():
+        if c.name in ignored_filenames:
+            continue
         if c.is_file():
             cstat = c.stat()
             if cstat.st_mtime >= after_ts:
                 return True, None
             total_size += cstat.st_size
         elif c.is_dir():
-            was_modified, size = was_modified_after(c, after)
+            was_modified, size = was_modified_after(c, after, ignored_filenames)
             if was_modified:
                 return True, None
             total_size += size
@@ -77,7 +97,7 @@ def md5sum_gcs(object_path: str):
 
 
 @contextmanager
-def archive_dir(dir_path: Path):
+def archive_dir(dir_path: Path, ignored_filenames: list):
     """
     Archive given directory reproducibly to out_path
     """
@@ -92,8 +112,7 @@ def archive_dir(dir_path: Path):
             "--create",
             "--gzip",
             f"--file={target_file}",
-            "."
-        ]
+        ] +  [f'--exclude={ignored_file}' for ignored_file in ignored_filenames] + [ '.']
         try:
             # Capture output and fail explicitly on non-0 error code
             # Primarily to get rid of tar: Removing leading `/' from member names
@@ -137,13 +156,20 @@ def main():
     )
     argparser.add_argument(
         "--delete",
-        help="Delete uploaded objects"
+        help="Delete uploaded objects",
+        action='store_true'
+    )
+    argparser.add_argument(
+        '--notice-file-name',
+        help='Name of file to create with instructions on how to retrieve your archive',
+        default='WHERE-ARE-MY-FILES.txt'
     )
 
     args = argparser.parse_args()
 
     root_dir: Path = args.root_dir
     object_prefix: str = args.object_prefix.rstrip("/")
+    ignored_filenames = [args.notice_file_name]
 
     cutoff_date = datetime.now() - timedelta(days=args.days_ago)
 
@@ -155,34 +181,46 @@ def main():
     for p in root_dir.iterdir():
         if p.is_dir():
             print(f'{p.name:32} -> ', end='')
-            is_active, dirsize = was_modified_after(p, cutoff_date)
+            is_active, dirsize = was_modified_after(p, cutoff_date, ignored_filenames)
             if is_active:
                 print(f'{"Active":16} -> Skipped')
                 active_count += 1
             else:
-                with archive_dir(p) as target_file:
+                with archive_dir(p, ignored_filenames) as target_file:
                     size = target_file.stat().st_size
                     inactive_count += 1
                     inactive_compressed_space += size
                     inactive_space += dirsize
-                    print(f'Archived {(size / 1024 / 1024):5.1f}mb -> ', end='')
+                    print(f'Archiving {(size / 1024 / 1024):5.1f}mb -> ', end='')
                     target_object_path = f'{object_prefix}/{target_file.name}'
                     if args.action == 'upload':
                         upload_to_gcs(target_file, target_object_path)
-                        print('Uploaded!', end='')
-                        if args.delete:
-                            # DELETE THE DIRECTORY
-                            shutil.rmtree(p)
-                            print('-> Deleted!', end='')
-                        print() # Print a newline
+                        print('Uploaded!')
                     elif args.action == 'validate':
                         local_md5 = md5sum_local(target_file)
                         remote_md5 = md5sum_gcs(target_object_path)
                         if local_md5 != remote_md5:
-                            print(f'Validation failed! local mdf: {local_md5}, remote md5: {remote_md5}')
+                            print(f'Validation failed! local md5: {local_md5}, remote md5: {remote_md5}')
                             sys.exit(1)
                         else:
-                            print('Validated!')
+                            print('Validated! -> ', end='')
+                            if args.delete:
+                                # DELETE THE DIRECTORY
+                                notice_content = NOTICE_CONTENT_TEMPLATE.format(object_id=target_object_path)
+                                notice_file = p / args.notice_file_name
+                                with open(notice_file, 'w') as f:
+                                    f.write(notice_content)
+                                print('Notice printed! -> ', end='')
+
+                                for subchild in p.iterdir():
+                                    if subchild.name in ignored_filenames:
+                                        continue
+                                    if subchild.is_dir():
+                                        shutil.rmtree(subchild)
+                                    else:
+                                        os.remove(subchild)
+                                print('-> Deleted!', end='')
+                            print()
     print(
         f"Active: {active_count}, Inactive: {inactive_count}, Inactive Uncompressed Size: {(inactive_space / 1024 / 1024 / 1024):.2f}, Inactive Compressed Size: {(inactive_compressed_space / 1024 / 1024 / 1024):.2f}gb"
     )
