@@ -1,6 +1,7 @@
 """
 Scan directories to see if they have files modified in the last x days
 """
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 from pathlib import Path
 import subprocess
@@ -89,11 +90,15 @@ def md5sum_gcs(object_path: str):
     """
     Return base64-encoded md5 of object_path on GCS
     """
-    output = subprocess.check_output([
-        'gsutil', '-q', 'ls', '-L', object_path
-    ]).decode()
-    match = re.search(r'Hash \(md5\):\s*(.*)\n', output)
-    return match.group(1)
+    try:
+        output = subprocess.check_output([
+            'gsutil', '-q', 'ls', '-L', object_path
+        ]).decode()
+        match = re.search(r'Hash \(md5\):\s*(.*)\n', output)
+        return match.group(1)
+    except Exception as e:
+        print(e)
+        return None
 
 
 @contextmanager
@@ -131,10 +136,53 @@ def upload_to_gcs(file_path: Path, target_path: str):
     Upload file_path to target_path on GCS
     """
     md5 = md5sum_local(file_path)
-    subprocess.check_call(
-        ["gsutil", "-q", "-h", f"Content-MD5={md5}", "cp", str(file_path), target_path]
-    )
+    subprocess.check_call(["gsutil", "-q", "-h", f"Content-MD5={md5}", "cp", str(file_path), target_path])
 
+
+def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_name, delete):
+    print(f'{p.name:32} -> ', end='')
+    is_active, dirsize = was_modified_after(p, cutoff_date, ignored_filenames)
+    if is_active:
+        print(f'{"Active":16} -> Skipped')
+        return {
+            'active': True,
+            'uncompressed_size': dirsize,
+            'compressed_size': None
+        }
+    else:
+        with archive_dir(p, ignored_filenames) as target_file:
+            size = target_file.stat().st_size
+            # print(f'Archiving {(size / 1024 / 1024):5.1f}mb -> ', end='')
+            target_object_path = f'{object_prefix}/{target_file.name}'
+            local_md5 = md5sum_local(target_file)
+            remote_md5 = md5sum_gcs(target_object_path)
+            if local_md5 != remote_md5:
+                upload_to_gcs(target_file, target_object_path)
+                print('Uploaded! -> ', end='')
+            else:
+                print('Validated! -> ', end='')
+            if delete:
+                # DELETE THE DIRECTORY
+                notice_content = NOTICE_CONTENT_TEMPLATE.format(object_id=target_object_path)
+                notice_file = p / notice_file_name
+                with open(notice_file, 'w') as f:
+                    f.write(notice_content)
+                print('Notice printed! -> ', end='')
+
+                for subchild in p.iterdir():
+                    if subchild.name in ignored_filenames:
+                        continue
+                    if subchild.is_dir():
+                        shutil.rmtree(subchild)
+                    else:
+                        os.remove(subchild)
+                print('-> Deleted!', end='')
+            print()
+            return {
+                'active': False,
+                'uncompressed_size': dirsize,
+                'compressed_size': size
+            }
 
 def main():
     argparser = argparse.ArgumentParser()
@@ -165,6 +213,11 @@ def main():
         default='WHERE-ARE-MY-FILES.txt'
     )
 
+    argparser.add_argument(
+        '--user',
+        help='Only perform action for this user'
+    )
+
     args = argparser.parse_args()
 
     root_dir: Path = args.root_dir
@@ -178,49 +231,28 @@ def main():
     inactive_space = 0
     inactive_compressed_space = 0
 
-    for p in root_dir.iterdir():
-        if p.is_dir():
-            print(f'{p.name:32} -> ', end='')
-            is_active, dirsize = was_modified_after(p, cutoff_date, ignored_filenames)
-            if is_active:
-                print(f'{"Active":16} -> Skipped')
-                active_count += 1
-            else:
-                with archive_dir(p, ignored_filenames) as target_file:
-                    size = target_file.stat().st_size
-                    inactive_count += 1
-                    inactive_compressed_space += size
-                    inactive_space += dirsize
-                    print(f'Archiving {(size / 1024 / 1024):5.1f}mb -> ', end='')
-                    target_object_path = f'{object_prefix}/{target_file.name}'
-                    if args.action == 'upload':
-                        upload_to_gcs(target_file, target_object_path)
-                        print('Uploaded!')
-                    elif args.action == 'validate':
-                        local_md5 = md5sum_local(target_file)
-                        remote_md5 = md5sum_gcs(target_object_path)
-                        if local_md5 != remote_md5:
-                            print(f'Validation failed! local md5: {local_md5}, remote md5: {remote_md5}')
-                            sys.exit(1)
-                        else:
-                            print('Validated! -> ', end='')
-                            if args.delete:
-                                # DELETE THE DIRECTORY
-                                notice_content = NOTICE_CONTENT_TEMPLATE.format(object_id=target_object_path)
-                                notice_file = p / args.notice_file_name
-                                with open(notice_file, 'w') as f:
-                                    f.write(notice_content)
-                                print('Notice printed! -> ', end='')
+    pool = ThreadPoolExecutor(max_workers=64)
+    futures = []
 
-                                for subchild in p.iterdir():
-                                    if subchild.name in ignored_filenames:
-                                        continue
-                                    if subchild.is_dir():
-                                        shutil.rmtree(subchild)
-                                    else:
-                                        os.remove(subchild)
-                                print('-> Deleted!', end='')
-                            print()
+    if args.user:
+        dirs = [root_dir / args.user]
+    else:
+        dirs = [p for p in root_dir.iterdir() if p.is_dir()]
+    for p in dirs:
+        future = pool.submit(process_dir,
+            p, cutoff_date, ignored_filenames, object_prefix, args.notice_file_name, args.delete
+        )
+        futures.append(future)
+
+    for future in as_completed(futures):
+        result = future.result()
+        if result['active']:
+            active_count += 1
+        else:
+            inactive_count += 1
+            inactive_space += result['uncompressed_size']
+            inactive_compressed_space += result['compressed_size']
+
     print(
         f"Active: {active_count}, Inactive: {inactive_count}, Inactive Uncompressed Size: {(inactive_space / 1024 / 1024 / 1024):.2f}, Inactive Compressed Size: {(inactive_compressed_space / 1024 / 1024 / 1024):.2f}gb"
     )
