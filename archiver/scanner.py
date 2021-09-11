@@ -17,9 +17,12 @@ import shutil
 NOTICE_CONTENT_TEMPLATE = """
 Your files have been archived due to inactivity.
 
-Send an email to ds-infrastructure@lists.berkeley.edu from your berkeley.edu
-email address to get a copy of your files. You must include the following
-text to help us retrieve your file:
+If you want to retrieve a copy of your files, please
+open a Data Archival Request via github here:
+https://github.com/berkeley-dsep-infra/datahub/issues/new?assignees=&labels=support&template=data_archival_request.yml
+
+The following text is the link to your datahub folder,
+it must be included with your request:
 
 {object_id}
 """
