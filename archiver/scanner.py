@@ -124,7 +124,7 @@ def md5sum_gcs(object_path: str):
         match = re.search(r'Hash \(md5\):\s*(.*)\n', output)
         return match.group(1)
     except Exception as e:
-        print(e)
+        # Object does not exist
         return None
 
 
@@ -189,19 +189,23 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
             #    as our local freshly created archive, we do nothing.
             # 2. If there is *no* object currently in storage, we upload the freshly
             #    created archive.
-            # 3. If there is already an existing object in storage, but it is not the
-            #    same as our freshly created archive, overwrite it!
+            # 3. If there is already an existing object in storage, we raise an error
+            #    and exit. This shouldn't happen because gsutil should fail if it does
+            #    not verify the object fully uploaded.
             #
             # This lets us run the script multiple times idempotently, and it will deal with
             # any file corruption as needed.
-            # FIXME: We might accidentally overwrite a good existing remote object with a blank
-            # new archive. We should perhaps enable versioning for these objects
             local_md5 = md5sum_local(target_file)
             remote_md5 = md5sum_gcs(target_object_path)
-            if local_md5 != remote_md5:
+            if remote_md5 is None:
+                # object doesn't exist on object storage
                 upload_to_gcs(target_file, target_object_path)
                 print('Uploaded! -> ', end='')
+            elif local_md5 != remote_md5:
+                print(f'Remote object exists and does not match what we wanted! local: {local_md5}, remote: {remote_md5}')
+                sys.exit(-1)
             else:
+                # object exists in gcs and is the same as local file
                 print('Validated! -> ', end='')
 
             if delete:
