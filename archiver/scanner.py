@@ -1,5 +1,29 @@
 """
-Scan directories to see if they have files modified in the last x days
+Archive directories that haven't been modified to object storage.
+
+When users have not logged into their JupyterHub session for a long time,
+we want to move their home directories to object storage to save cost.
+This script can be run periodically to find such users, and archive their
+home directories to object storage.
+
+WHen run, this script will:
+
+1. Scan all user home directories (assumed to be subdirectories of the root provided
+   to the script) for *staleness*. A user home directory is considered stale if there
+   is not a single regular file (we do not currently count directories) that has been
+   created or modified since the cutoff date we give it. We also pass a list of file
+   names that are ignored when testing for staleness - this is primarily so that the
+   file we drop with instructions on how to retrieve your files doesn't mark the whole
+   home directory at unstale. At the end of this step, we have a list of user home
+   directories that are ready to be archived.
+2. Use `tar` to make a compressed archive of the stale home directory, and upload it
+   to object storage *if necessary*. So the script can be run multiple times, and it
+   will not do unnecessary uploads.
+3. If the --delete flag is passed, drop a note telling users where they can get their
+   files back from, and then *delete their files*. This is a destructive action!
+
+The idea is that you can run this script once to do all the uploads, and run it
+again with --delete to validate your uploads *and* delete existing home directories.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
@@ -146,6 +170,7 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
     print(f'{p.name:32} -> ', end='')
     is_active, dirsize = was_modified_after(p, cutoff_date, ignored_filenames)
     if is_active:
+        # The user home directory isn't stale, so let's ignore it
         print(f'{"Active":16} -> Skipped')
         return {
             'active': True,
@@ -153,10 +178,24 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
             'compressed_size': None
         }
     else:
+        # Compress the user home directory, but ignore files we don't want
         with archive_dir(p, ignored_filenames) as target_file:
             size = target_file.stat().st_size
             # print(f'Archiving {(size / 1024 / 1024):5.1f}mb -> ', end='')
             target_object_path = f'{object_prefix}/{target_file.name}'
+
+            # Run a reconciliation loop here to ensure we do an upload here.
+            # 1. If there is an object currently in storage, and it has the same md5
+            #    as our local freshly created archive, we do nothing.
+            # 2. If there is *no* object currently in storage, we upload the freshly
+            #    created archive.
+            # 3. If there is already an existing object in storage, but it is not the
+            #    same as our freshly created archive, overwrite it!
+            #
+            # This lets us run the script multiple times idempotently, and it will deal with
+            # any file corruption as needed.
+            # FIXME: We might accidentally overwrite a good existing remote object with a blank
+            # new archive. We should perhaps enable versioning for these objects
             local_md5 = md5sum_local(target_file)
             remote_md5 = md5sum_gcs(target_object_path)
             if local_md5 != remote_md5:
@@ -164,8 +203,12 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
                 print('Uploaded! -> ', end='')
             else:
                 print('Validated! -> ', end='')
+
             if delete:
-                # DELETE THE DIRECTORY
+                # DELETE THE USER HOME DIRECTORY!
+                # This is a destructive action, and we require a special flag for it
+                # We drop the text file with the notice on how to retrieve your files, and
+                # then delete all other files.
                 notice_content = NOTICE_CONTENT_TEMPLATE.format(object_id=target_object_path)
                 notice_file = p / notice_file_name
                 with open(notice_file, 'w') as f:
@@ -180,6 +223,7 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
                     else:
                         os.remove(subchild)
                 print('-> Deleted!', end='')
+            # print an empty newline to make output format look nice
             print()
             return {
                 'active': False,
@@ -189,10 +233,6 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
 
 def main():
     argparser = argparse.ArgumentParser()
-    argparser.add_argument(
-        'action', choices=['validate', 'upload'],
-        help='Validate already uploaded files, or upload new files'
-    )
     argparser.add_argument(
         "root_dir", help="Root directory containing user home directories", type=Path
     )
@@ -234,6 +274,8 @@ def main():
     inactive_space = 0
     inactive_compressed_space = 0
 
+    # tarring is CPU bound, so we can parallelize trivially.
+    # FIXME: This should be tuneable, or at least default to some multiple of number of cores on the system
     pool = ThreadPoolExecutor(max_workers=64)
     futures = []
 
