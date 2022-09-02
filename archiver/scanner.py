@@ -82,8 +82,8 @@ def was_modified_after(path: Path, after: datetime, ignored_filenames: list):
     # what is checked for freshness - `tar` copies everything anyway
     for c in path.iterdir():
         if c.name in ignored_filenames:
-            continue
-        if c.is_file():
+            return True, None
+        elif c.is_file():
             cstat = c.stat()
             if cstat.st_mtime >= after_ts:
                 return True, None
@@ -93,6 +93,7 @@ def was_modified_after(path: Path, after: datetime, ignored_filenames: list):
             if was_modified:
                 return True, None
             total_size += size
+
     return False, total_size
 
 
@@ -172,6 +173,13 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
     if is_active:
         # The user home directory isn't stale, so let's ignore it
         print(f'{"Active":16} -> Skipped')
+        return {
+            'active': True,
+            'uncompressed_size': dirsize,
+            'compressed_size': None
+        }
+    elif int(dirsize) >= 100000000000:
+        print(f'Too Big {dirsize} -> Skipped')
         return {
             'active': True,
             'uncompressed_size': dirsize,
@@ -280,7 +288,7 @@ def main():
 
     # tarring is CPU bound, so we can parallelize trivially.
     # FIXME: This should be tuneable, or at least default to some multiple of number of cores on the system
-    pool = ThreadPoolExecutor(max_workers=64)
+    pool = ThreadPoolExecutor(max_workers=30)
     futures = []
 
     if args.user:
