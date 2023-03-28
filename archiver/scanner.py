@@ -39,16 +39,14 @@ import shutil
 
 
 NOTICE_CONTENT_TEMPLATE = """
-Your files have been archived due to inactivity.
+Your {hub} files have been archived due to inactivity.
 
-If you want to retrieve a copy of your files, please
-open a Data Archival Request via github here:
-https://github.com/berkeley-dsep-infra/datahub/issues/new?assignees=&labels=support&template=data_archival_request.yml&title=Request+retrieval+of+my+Datahub+files
+If you want to retrieve a copy of your files through email, please open a Data Archival Request via GitHub using the custom URL below:
 
-The following text is the link to your datahub folder,
-it must be included with your request:
+https://github.com/berkeley-dsep-infra/datahub/issues/new?assignees=&labels=support&template=data_archival_request.yml&title=Request+my+old+files+stored+in+Datahub&link={object_id}
 
-{object_id}
+After submitting the form, a Datahub admin will send you a signed link to download your {hub} files via email within a few days.
+
 """
 
 
@@ -221,7 +219,8 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
                 # This is a destructive action, and we require a special flag for it
                 # We drop the text file with the notice on how to retrieve your files, and
                 # then delete all other files.
-                notice_content = NOTICE_CONTENT_TEMPLATE.format(object_id=target_object_path)
+                hub = target_object_path.split('/')[-2]
+                notice_content = NOTICE_CONTENT_TEMPLATE.format(object_id=target_object_path,hub=hub)
                 notice_file = p / notice_file_name
                 with open(notice_file, 'w') as f:
                     f.write(notice_content)
