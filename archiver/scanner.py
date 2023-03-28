@@ -45,7 +45,7 @@ If you want to retrieve a copy of your files through email, please open a Data A
 
 https://github.com/berkeley-dsep-infra/datahub/issues/new?assignees=&labels=support&template=data_archival_request.yml&title=Request+my+old+files+stored+in+Datahub&link={object_id}
 
-After submitting the form, a Datahub admin will send you a signed link to download your Datahub files via email within a few days.
+After submitting the form, a Datahub admin will send you a signed link to download your {hub} files via email within a few days.
 
 """
 
