@@ -295,10 +295,9 @@ def main():
     else:
         dirs = [p for p in root_dir.iterdir() if p.is_dir()]
     for p in dirs:
-        future = pool.submit(process_dir,
-            p, cutoff_date, ignored_filenames, object_prefix, args.notice_file_name, args.delete
-        )
-        futures.append(future)
+        if '_shared' not in p.name:
+            future = pool.submit(process_dir, p, cutoff_date, ignored_filenames, object_prefix, args.notice_file_name, args.delete)
+            futures.append(future)
 
     for future in as_completed(futures):
         result = future.result()
