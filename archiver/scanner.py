@@ -171,7 +171,7 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
     # check for WAMF.txt and skip if found on the top level
     for c in p.iterdir():
         if c.name == notice_file_name:
-            print(f'{"Archived":16} -> Skipped')
+            print(f'{"Already archived":16} -> Skipped')
             return {
                 'active': True,
                 'uncompressed_size': None,
