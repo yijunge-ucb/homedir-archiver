@@ -167,6 +167,17 @@ def upload_to_gcs(file_path: Path, target_path: str):
 
 def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_name, delete):
     print(f'{p.name:32} -> ', end='')
+
+    # check for WAMF.txt and skip if found on the top level
+    for c in p.iterdir():
+        if c.name == notice_file_name:
+            print(f'{"Archived":16} -> Skipped')
+            return {
+                'active': True,
+                'uncompressed_size': None,
+                'compressed_size': None
+            }
+
     is_active, dirsize = was_modified_after(p, cutoff_date, ignored_filenames)
     if is_active:
         # The user home directory isn't stale, so let's ignore it
@@ -276,7 +287,7 @@ def main():
 
     root_dir: Path = args.root_dir
     object_prefix: str = args.object_prefix.rstrip("/")
-    ignored_filenames = [args.notice_file_name]
+    ignored_filenames = []
 
     cutoff_date = datetime.now() - timedelta(days=args.days_ago)
 
