@@ -240,6 +240,8 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
                 for subchild in p.iterdir():
                     if subchild.name in ignored_filenames:
                         continue
+                    if subchild.name == notice_file_name:
+                        continue
                     if subchild.is_dir():
                         shutil.rmtree(subchild)
                     else:
