@@ -36,6 +36,8 @@ import os
 from contextlib import contextmanager
 import sys
 import shutil
+import glob
+import fnmatch
 
 
 NOTICE_CONTENT_TEMPLATE = """
@@ -80,7 +82,7 @@ def was_modified_after(path: Path, after: datetime, ignored_filenames: list):
     # what is checked for freshness - `tar` copies everything anyway
     for c in path.iterdir():
         if c.name in ignored_filenames:
-            return True, None
+            continue
         elif c.is_file():
             cstat = c.stat()
             if cstat.st_mtime >= after_ts:
@@ -127,12 +129,30 @@ def md5sum_gcs(object_path: str):
         return None
 
 
+def should_run_tar(dir_path, ignored_filenames):
+    # Check if the directory is empty
+    if not os.listdir(dir_path):
+        print(f"The directory {dir_path} is empty. Skipping tar creation.")
+        return False
+
+    # Check if any file doesn't match the exclusion patterns
+    for root, _, files in os.walk(dir_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            # Check if the file does not match any of the excluded patterns
+            if not any(fnmatch.fnmatch(file_path, ignored_file) for ignored_file in ignored_filenames):
+                return True  # Found a file that should be included, so return True
+
+    # If no files match the inclusion criteria, skip tar creation
+    print(f"The directory {dir_path} only contains files that match the exclusion criteria. Skipping tar creation.")
+    return False
+
+
 @contextmanager
 def archive_dir(dir_path: Path, ignored_filenames: list):
     """
     Archive given directory reproducibly to out_path
     """
-
     with tempfile.TemporaryDirectory() as d:
         target_file = Path(d) / (dir_path.name + ".tar.gz")
         cmd = [
@@ -155,7 +175,7 @@ def archive_dir(dir_path: Path, ignored_filenames: list):
             sys.exit(1)
 
         yield target_file
-
+ 
 
 def upload_to_gcs(file_path: Path, target_path: str):
     """
@@ -196,64 +216,68 @@ def process_dir(p, cutoff_date, ignored_filenames, object_prefix, notice_file_na
         }
     else:
         # Compress the user home directory, but ignore files we don't want
-        with archive_dir(p, ignored_filenames) as target_file:
-            size = target_file.stat().st_size
-            # print(f'Archiving {(size / 1024 / 1024):5.1f}mb -> ', end='')
-            target_object_path = f'{object_prefix}/{target_file.name}'
+        if should_run_tar(p, ignored_filenames):
+            with archive_dir(p, ignored_filenames) as target_file:
+                size = target_file.stat().st_size
+                # print(f'Archiving {(size / 1024 / 1024):5.1f}mb -> ', end='')
+                target_object_path = f'{object_prefix}/{target_file.name}'
 
-            # Run a reconciliation loop here to ensure we do an upload here.
-            # 1. If there is an object currently in storage, and it has the same md5
-            #    as our local freshly created archive, we do nothing.
-            # 2. If there is *no* object currently in storage, we upload the freshly
-            #    created archive.
-            # 3. If there is already an existing object in storage, we raise an error
-            #    and exit. This shouldn't happen because gsutil should fail if it does
-            #    not verify the object fully uploaded.
-            #
-            # This lets us run the script multiple times idempotently, and it will deal with
-            # any file corruption as needed.
-            local_md5 = md5sum_local(target_file)
-            remote_md5 = md5sum_gcs(target_object_path)
-            if remote_md5 is None:
-                # object doesn't exist on object storage
-                upload_to_gcs(target_file, target_object_path)
-                print('Uploaded! -> ', end='')
-            elif local_md5 != remote_md5:
-                print(f'Remote object exists and does not match what we wanted! local: {local_md5}, remote: {remote_md5}')
-                sys.exit(-1)
-            else:
-                # object exists in gcs and is the same as local file
-                print('Validated! -> ', end='')
+                # Run a reconciliation loop here to ensure we do an upload here.
+                # 1. If there is an object currently in storage, and it has the same md5
+                #    as our local freshly created archive, we do nothing.
+                # 2. If there is *no* object currently in storage, we upload the freshly
+                #    created archive.
+                # 3. If there is already an existing object in storage, we raise an error
+                #    and exit. This shouldn't happen because gsutil should fail if it does
+                #    not verify the object fully uploaded.
+                #
+                # This lets us run the script multiple times idempotently, and it will deal with
+                # any file corruption as needed.
+                local_md5 = md5sum_local(target_file)
+                remote_md5 = md5sum_gcs(target_object_path)
+                if remote_md5 is None:
+                    # object doesn't exist on object storage
+                    upload_to_gcs(target_file, target_object_path)
+                    print('Uploaded! -> ', end='')
+                    if local_md5 != remote_md5:
+                        print(f'Remote object exists and does not match what we wanted! local: {local_md5}, remote: {remote_md5}')
+                        sys.exit(-1)
+                elif local_md5 != remote_md5:
+                    print(f'Remote object exists and does not match what we wanted! local: {local_md5}, remote: {remote_md5}')
+                    sys.exit(-1)
+                else:
+                    # object exists in gcs and is the same as local file
+                    print('Validated! -> ', end='')
 
-            if delete:
-                # DELETE THE USER HOME DIRECTORY!
-                # This is a destructive action, and we require a special flag for it
-                # We drop the text file with the notice on how to retrieve your files, and
-                # then delete all other files.
-                hub = target_object_path.split('/')[-2]
-                notice_content = NOTICE_CONTENT_TEMPLATE.format(object_id=target_object_path,hub=hub)
-                notice_file = p / notice_file_name
-                with open(notice_file, 'w') as f:
-                    f.write(notice_content)
-                print('Notice printed! -> ', end='')
+                if delete:
+                    # DELETE THE USER HOME DIRECTORY!
+                    # This is a destructive action, and we require a special flag for it
+                    # We drop the text file with the notice on how to retrieve your files, and
+                    # then delete all other files.
+                    hub = target_object_path.split('/')[-2]
+                    notice_content = NOTICE_CONTENT_TEMPLATE.format(object_id=target_object_path,hub=hub)
+                    notice_file = p / notice_file_name
+                    with open(notice_file, 'w') as f:
+                        f.write(notice_content)
+                    print('Notice printed! -> ', end='')
 
-                for subchild in p.iterdir():
-                    if subchild.name in ignored_filenames:
-                        continue
-                    if subchild.name == notice_file_name:
-                        continue
-                    if subchild.is_dir():
-                        shutil.rmtree(subchild)
-                    else:
-                        os.remove(subchild)
-                print('-> Deleted!', end='')
-            # print an empty newline to make output format look nice
-            print()
-            return {
-                'active': False,
-                'uncompressed_size': dirsize,
-                'compressed_size': size
-            }
+                    for subchild in p.iterdir():
+                        if subchild.name in ignored_filenames:
+                            continue
+                        if subchild.name == notice_file_name:
+                            continue
+                        if subchild.is_dir():
+                            shutil.rmtree(subchild)
+                        else:
+                            os.remove(subchild)
+                    print('-> Deleted!', end='')
+                # print an empty newline to make output format look nice
+                print()
+                return {
+                    'active': False,
+                    'uncompressed_size': dirsize,
+                    'compressed_size': size
+                }
 
 def main():
     argparser = argparse.ArgumentParser()
@@ -274,10 +298,17 @@ def main():
         help="Delete uploaded objects",
         action='store_true'
     )
+    # Get the current date in the desired format (e.g., YYYY-MM-DD)
+    current_date = datetime.now().strftime('%Y-%m-%d')
+
+    # Append the current date to the default filename
+    default_filename = f"WHERE-ARE-MY-FILES-{current_date}.txt"
+
+
     argparser.add_argument(
         '--notice-file-name',
         help='Name of file to create with instructions on how to retrieve your archive',
-        default='WHERE-ARE-MY-FILES.txt'
+        default=default_filename
     )
 
     argparser.add_argument(
@@ -289,7 +320,7 @@ def main():
 
     root_dir: Path = args.root_dir
     object_prefix: str = args.object_prefix.rstrip("/")
-    ignored_filenames = []
+    ignored_filenames = glob.glob('WHERE-ARE-MY-FILES-*')
 
     cutoff_date = datetime.now() - timedelta(days=args.days_ago)
 
